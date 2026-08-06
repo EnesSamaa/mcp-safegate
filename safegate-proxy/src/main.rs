@@ -3,6 +3,7 @@
 mod config;
 mod identity;
 mod proxy;
+mod rate_limit;
 
 use std::sync::Arc;
 

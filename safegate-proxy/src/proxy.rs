@@ -1,5 +1,7 @@
 //! HTTP request validation and upstream forwarding.
 
+use std::sync::Arc;
+
 use http_body_util::{BodyExt, Full};
 use hyper::{
     Request, Response, StatusCode, Uri,
@@ -16,14 +18,19 @@ use tracing::{info, warn};
 
 use crate::config::ProxyConfig;
 use crate::identity::extract_agent_context;
+use crate::rate_limit::RateLimiter;
 
 type ProxyBody = Full<Bytes>;
 type HttpClient = Client<HttpConnector, ProxyBody>;
+
+const AGENT_RATE_LIMIT: usize = 60;
+const AGENT_RATE_LIMIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Reverse proxy that validates JSON-RPC requests and forwards them to MCP.
 pub struct Proxy {
     target_base: Uri,
     client: HttpClient,
+    rate_limiter: Arc<RateLimiter>,
 }
 
 impl Proxy {
@@ -42,6 +49,7 @@ impl Proxy {
         Ok(Self {
             target_base,
             client: Client::builder(TokioExecutor::new()).build_http(),
+            rate_limiter: Arc::new(RateLimiter::new()),
         })
     }
 
@@ -57,6 +65,13 @@ impl Proxy {
             );
         }
         info!(?agent_ctx, "Agent request received");
+        if let Err(error) = self.rate_limiter.check_rate_limit(
+            &agent_ctx.agent_id,
+            AGENT_RATE_LIMIT,
+            AGENT_RATE_LIMIT_WINDOW,
+        ) {
+            return json_rpc_error_response(StatusCode::TOO_MANY_REQUESTS, Value::Null, error);
+        }
 
         let body = match body.collect().await {
             Ok(collected) => collected.to_bytes(),
