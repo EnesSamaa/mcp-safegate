@@ -126,9 +126,7 @@ impl Proxy {
                     return json_rpc_error_response(
                         StatusCode::BAD_REQUEST,
                         Value::Null,
-                        SafeGateError::JsonRpcError(format!(
-                            "invalid JSON-RPC request: {error}"
-                        )),
+                        SafeGateError::JsonRpcError(format!("invalid JSON-RPC request: {error}")),
                     );
                 }
             }
@@ -230,12 +228,9 @@ fn upstream_uri(target_base: &Uri, incoming: &Uri) -> Result<Uri, SafeGateError>
 /// Used by the `RedactArgs` policy decision to rewrite tool call arguments before
 /// the request is forwarded upstream.  If parsing fails the original bytes are
 /// returned unchanged (the caller falls back to the original body).
-fn rebuild_tool_call_body(
-    original: &[u8],
-    new_args_json: &str,
-) -> Result<Bytes, SafeGateError> {
-    let mut rpc: Value = serde_json::from_slice(original)
-        .map_err(|e| SafeGateError::JsonRpcError(e.to_string()))?;
+fn rebuild_tool_call_body(original: &[u8], new_args_json: &str) -> Result<Bytes, SafeGateError> {
+    let mut rpc: Value =
+        serde_json::from_slice(original).map_err(|e| SafeGateError::JsonRpcError(e.to_string()))?;
     let new_args: Value = serde_json::from_str(new_args_json)
         .map_err(|e| SafeGateError::JsonRpcError(e.to_string()))?;
     if let Some(params) = rpc.get_mut("params") {

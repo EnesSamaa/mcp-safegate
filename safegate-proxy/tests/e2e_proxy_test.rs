@@ -72,9 +72,7 @@ async fn start_proxy_with_engine(
             tokio::spawn(async move {
                 let service = service_fn(move |request| {
                     let proxy = Arc::clone(&proxy);
-                    async move {
-                        Ok::<_, std::convert::Infallible>(proxy.handle_request(request).await)
-                    }
+                    async move { Ok::<_, std::convert::Infallible>(proxy.handle_request(request).await) }
                 });
                 let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(TokioIo::new(stream), service)
@@ -116,9 +114,7 @@ async fn forwards_authenticated_json_rpc_calls_to_upstream() {
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "application/json")
-                .set_body_json(
-                    serde_json::json!({"jsonrpc":"2.0","id":1,"result":{"ok":true}}),
-                ),
+                .set_body_json(serde_json::json!({"jsonrpc":"2.0","id":1,"result":{"ok":true}})),
         )
         .mount(&upstream)
         .await;

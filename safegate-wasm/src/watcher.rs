@@ -89,15 +89,15 @@ async fn watch_policy_dir(policy_dir: PathBuf, shared: Arc<ArcSwap<WasmPolicyEng
         };
 
     // Ensure the policy directory exists before we try to watch it.
-    if !policy_dir.exists() {
-        if let Err(error) = std::fs::create_dir_all(&policy_dir) {
-            warn!(
-                dir = %policy_dir.display(),
-                %error,
-                "failed to create policy directory; hot-reload disabled"
-            );
-            return;
-        }
+    if !policy_dir.exists()
+        && let Err(error) = std::fs::create_dir_all(&policy_dir)
+    {
+        warn!(
+            dir = %policy_dir.display(),
+            %error,
+            "failed to create policy directory; hot-reload disabled"
+        );
+        return;
     }
 
     if let Err(error) = watcher.watch(&policy_dir, RecursiveMode::NonRecursive) {
