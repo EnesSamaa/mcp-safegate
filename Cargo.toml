@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "safegate-core",
+    "safegate-proxy",
+    "safegate-wasm",
+    "safegate-audit",
+]
+resolver = "2"
