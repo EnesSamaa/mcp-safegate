@@ -1,6 +1,7 @@
 //! SafeGate's asynchronous MCP reverse proxy executable.
 
 mod config;
+mod identity;
 mod proxy;
 
 use std::sync::Arc;

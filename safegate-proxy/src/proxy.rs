@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use crate::config::ProxyConfig;
+use crate::identity::extract_agent_context;
 
 type ProxyBody = Full<Bytes>;
 type HttpClient = Client<HttpConnector, ProxyBody>;
@@ -47,6 +48,16 @@ impl Proxy {
     /// Validates an inbound request and relays it to the configured upstream MCP server.
     pub async fn handle_request(&self, request: Request<Incoming>) -> Response<ProxyBody> {
         let (parts, body) = request.into_parts();
+        let agent_ctx = extract_agent_context(&parts.headers);
+        if !agent_ctx.authenticated {
+            return json_rpc_error_response(
+                StatusCode::UNAUTHORIZED,
+                Value::Null,
+                SafeGateError::Unauthorized("missing or invalid bearer token".to_owned()),
+            );
+        }
+        info!(?agent_ctx, "Agent request received");
+
         let body = match body.collect().await {
             Ok(collected) => collected.to_bytes(),
             Err(error) => {
