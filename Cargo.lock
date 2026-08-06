@@ -1854,6 +1854,7 @@ name = "safegate-wasm"
 version = "0.1.0"
 dependencies = [
  "safegate-core",
+ "tokio",
  "wasmtime",
  "wasmtime-wasi",
  "wit-bindgen",

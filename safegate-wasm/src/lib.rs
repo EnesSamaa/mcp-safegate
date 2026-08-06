@@ -4,8 +4,13 @@ use std::{path::Path, sync::Arc};
 
 use safegate_core::{AgentContext, McpToolCallParams, SafeGateError};
 use wasmtime::component::{Component, Linker};
-use wasmtime::{Config, Engine, Store};
+use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
+
+/// Resource limits and execution deadlines for policy components.
+pub mod sandbox;
+
+use crate::sandbox::WasmSandboxConfig;
 
 /// Bindings generated directly from the SafeGate WIT policy contract.
 ///
@@ -23,21 +28,24 @@ pub mod bindings {
 pub struct WasiState {
     ctx: WasiCtx,
     table: ResourceTable,
+    limits: StoreLimits,
 }
 
 impl WasiState {
-    /// Creates a minimal, capability-free WASI host state.
-    pub fn new() -> Self {
+    /// Creates a capability-free WASI host state with the supplied resource limits.
+    ///
+    /// No environment, standard I/O streams, preopened directories, sockets, or
+    /// outbound HTTP capabilities are inherited or registered with this context.
+    pub fn new(sandbox: &WasmSandboxConfig) -> Self {
         Self {
+            // This deliberately has no `inherit_*` or preopen/network calls.
             ctx: WasiCtxBuilder::new().build(),
             table: ResourceTable::new(),
+            limits: StoreLimitsBuilder::new()
+                .memory_size(sandbox.max_memory_bytes)
+                .trap_on_grow_failure(true)
+                .build(),
         }
-    }
-}
-
-impl Default for WasiState {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -69,14 +77,21 @@ pub struct WasmPolicyEngine {
     engine: Engine,
     linker: Linker<WasiState>,
     component: Option<Arc<Component>>,
+    sandbox: WasmSandboxConfig,
 }
 
 impl WasmPolicyEngine {
     /// Creates an engine configured for WASI Component Model execution.
     pub fn new() -> Result<Self, SafeGateError> {
+        Self::with_sandbox_config(WasmSandboxConfig::default())
+    }
+
+    /// Creates an engine using explicit resource and deadline limits.
+    pub fn with_sandbox_config(sandbox: WasmSandboxConfig) -> Result<Self, SafeGateError> {
         let mut config = Config::new();
         config.wasm_component_model(true);
         config.async_support(true);
+        config.epoch_interruption(true);
         let engine = Engine::new(&config).map_err(wasm_execution_error)?;
         let mut linker = Linker::new(&engine);
 
@@ -88,6 +103,7 @@ impl WasmPolicyEngine {
             engine,
             linker,
             component: None,
+            sandbox,
         })
     }
 
@@ -120,18 +136,37 @@ impl WasmPolicyEngine {
                 .map(ToString::to_string)
                 .unwrap_or_else(|| "null".to_owned()),
         };
-        let mut store = Store::new(&self.engine, WasiState::new());
-        let policy = bindings::SafegatePolicy::instantiate_async(
+        let mut store = Store::new(&self.engine, WasiState::new(&self.sandbox));
+        store.limiter(|state| &mut state.limits);
+        store.set_epoch_deadline(self.sandbox.epoch_deadlines);
+
+        let interrupt_engine = self.engine.clone();
+        let epoch_deadlines = self.sandbox.epoch_deadlines;
+        let timeout_task = tokio::spawn(async move {
+            tokio::time::sleep(WasmSandboxConfig::EXECUTION_TIMEOUT).await;
+            for _ in 0..epoch_deadlines {
+                interrupt_engine.increment_epoch();
+            }
+        });
+        let policy = match bindings::SafegatePolicy::instantiate_async(
             &mut store,
             component.as_ref(),
             &self.linker,
         )
         .await
-        .map_err(wasm_execution_error)?;
+        {
+            Ok(policy) => policy,
+            Err(error) => {
+                timeout_task.abort();
+                return Err(wasm_execution_error(error));
+            }
+        };
         let decision = policy
             .call_evaluate(&mut store, &wit_context, &wit_request)
             .await
-            .map_err(wasm_execution_error)?;
+            .map_err(wasm_execution_error);
+        timeout_task.abort();
+        let decision = decision?;
 
         Ok(match decision {
             bindings::PolicyDecision::Allow => PolicyDecision::Allow,

@@ -8,3 +8,4 @@ safegate-core = { path = "../safegate-core" }
 wasmtime = { version = "25", features = ["component-model", "async"] }
 wasmtime-wasi = "25"
 wit-bindgen = "0.30"
+tokio = { version = "1", features = ["rt", "time"] }
