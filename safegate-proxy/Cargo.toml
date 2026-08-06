@@ -6,7 +6,10 @@ edition = "2024"
 [dependencies]
 safegate-core = { path = "../safegate-core" }
 safegate-wasm = { path = "../safegate-wasm" }
+safegate-audit = { path = "../safegate-audit" }
 arc-swap = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["full"] }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }

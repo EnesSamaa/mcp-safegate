@@ -14,6 +14,7 @@ use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::{TokioExecutor, TokioIo},
 };
+use safegate_audit::writer::{AuditLogger, AuditSink};
 use safegate_proxy::{Proxy, ProxyConfig};
 use safegate_wasm::WasmPolicyEngine;
 use tokio::net::TcpListener;
@@ -24,11 +25,18 @@ use wiremock::{
 
 type TestBody = Full<Bytes>;
 
+const TEST_HMAC_SECRET: &[u8] = b"e2e-test-hmac-key";
+
 /// Creates a default (component-less) policy engine wrapped in the ArcSwap
 /// handle that `Proxy::new` expects.
 fn default_policy_engine() -> Arc<ArcSwap<WasmPolicyEngine>> {
     let engine = WasmPolicyEngine::new().expect("test engine should initialize");
     Arc::new(ArcSwap::from_pointee(engine))
+}
+
+/// Creates a stdout AuditLogger suitable for use in tests.
+fn test_audit_logger() -> Arc<AuditLogger> {
+    Arc::new(AuditLogger::new(AuditSink::Stdout, TEST_HMAC_SECRET))
 }
 
 /// Starts a full proxy instance bound to an ephemeral port and returns its URL.
@@ -58,6 +66,7 @@ async fn start_proxy_with_engine(
                 policy_dir: PathBuf::from("./policies"),
             },
             policy_engine,
+            test_audit_logger(),
         )
         .expect("test proxy should initialize"),
     );

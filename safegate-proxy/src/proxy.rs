@@ -1,6 +1,6 @@
 //! HTTP request validation and upstream forwarding.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use arc_swap::ArcSwap;
 use http_body_util::{BodyExt, Full};
@@ -13,10 +13,12 @@ use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::TokioExecutor,
 };
+use safegate_audit::{AuditDecision, writer::AuditLogger};
 use safegate_core::{JsonRpcErrorPayload, JsonRpcRequest, JsonRpcResponse, SafeGateError};
 use safegate_wasm::WasmPolicyEngine;
 use serde_json::{Value, json};
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::config::ProxyConfig;
 use crate::identity::extract_agent_context;
@@ -37,15 +39,21 @@ pub struct Proxy {
     ///
     /// Updated by [`PolicyWatcher`] whenever a new `.wasm` file is detected.
     policy_engine: Arc<ArcSwap<WasmPolicyEngine>>,
+    /// Non-blocking structured audit logger.
+    audit_logger: Arc<AuditLogger>,
 }
 
 impl Proxy {
-    /// Creates a proxy using the supplied configuration and a live policy engine handle.
+    /// Creates a proxy using the supplied configuration, a live policy engine
+    /// handle, and an audit logger.
     ///
     /// `policy_engine` is the [`ArcSwap`] produced by [`PolicyWatcher::shared()`].
+    /// `audit_logger` is shared via [`Arc`] so the same instance can be used by
+    /// multiple worker tasks.
     pub fn new(
         config: ProxyConfig,
         policy_engine: Arc<ArcSwap<WasmPolicyEngine>>,
+        audit_logger: Arc<AuditLogger>,
     ) -> Result<Self, SafeGateError> {
         let target_base = config.target_mcp_url.parse::<Uri>().map_err(|error| {
             SafeGateError::InternalError(format!("invalid target MCP URL: {error}"))
@@ -62,6 +70,7 @@ impl Proxy {
             client: Client::builder(TokioExecutor::new()).build_http(),
             rate_limiter: Arc::new(RateLimiter::new()),
             policy_engine,
+            audit_logger,
         })
     }
 
@@ -73,7 +82,11 @@ impl Proxy {
     /// 3. Body read + JSON-RPC parse
     /// 4. **WASM policy evaluation** (Allow / Deny / RedactArgs)
     /// 5. Upstream forwarding
+    /// 6. **Immutable audit log entry** (emitted for every outcome)
     pub async fn handle_request(&self, request: Request<Incoming>) -> Response<ProxyBody> {
+        let request_start = Instant::now();
+        let trace_id = Uuid::new_v4().to_string();
+
         // ── 1. Authentication ────────────────────────────────────────────────
         let (parts, body) = request.into_parts();
         let agent_ctx = extract_agent_context(&parts.headers);
@@ -134,12 +147,18 @@ impl Proxy {
             (Value::Null, None)
         };
 
+        let tool_name = tool_call_params
+            .as_ref()
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "<non-tool>".to_owned());
+
         // ── 4. WASM Policy evaluation ────────────────────────────────────────
         // Load a snapshot of the current engine (lock-free ArcSwap).
         let engine_guard = self.policy_engine.load();
 
         // `body_to_forward` may be replaced by RedactArgs.
-        let body_to_forward = if let Some(ref tool_params) = tool_call_params {
+        // `audit_decision` is captured for the log entry.
+        let (body_to_forward, audit_decision) = if let Some(ref tool_params) = tool_call_params {
             let wasm_ctx = safegate_core::AgentContext {
                 agent_id: agent_ctx.agent_id.clone(),
                 tenant_id: agent_ctx.tenant_id.clone(),
@@ -150,10 +169,18 @@ impl Proxy {
             match engine_guard.evaluate_policy(&wasm_ctx, tool_params).await {
                 Ok(safegate_wasm::PolicyDecision::Allow) => {
                     info!("WASM policy: Allow");
-                    body_bytes
+                    (body_bytes, AuditDecision::Allow)
                 }
                 Ok(safegate_wasm::PolicyDecision::Deny(reason)) => {
                     warn!(%reason, "WASM policy: Deny");
+                    let latency_us = request_start.elapsed().as_micros();
+                    self.emit_audit(
+                        &trace_id,
+                        &agent_ctx,
+                        &tool_name,
+                        AuditDecision::Deny(reason.clone()),
+                        latency_us,
+                    );
                     return json_rpc_error_response(
                         StatusCode::FORBIDDEN,
                         request_id,
@@ -163,24 +190,25 @@ impl Proxy {
                 Ok(safegate_wasm::PolicyDecision::RedactArgs(new_args_json)) => {
                     info!("WASM policy: RedactArgs – rewriting tool arguments");
                     // Rebuild the JSON-RPC body with the sanitised arguments.
-                    match rebuild_tool_call_body(&body_bytes, &new_args_json) {
+                    let new_body = match rebuild_tool_call_body(&body_bytes, &new_args_json) {
                         Ok(new_body) => new_body,
                         Err(error) => {
                             warn!(%error, "RedactArgs body rebuild failed; forwarding original");
                             body_bytes
                         }
-                    }
+                    };
+                    (new_body, AuditDecision::RedactArgs(new_args_json))
                 }
                 Err(error) => {
                     // No loaded component → treat as Allow (engine not yet warmed up).
                     // Other engine errors are logged but do not block the request.
                     warn!(%error, "WASM policy evaluation failed; allowing request");
-                    body_bytes
+                    (body_bytes, AuditDecision::Allow)
                 }
             }
         } else {
             // Non-tools/call method or non-POST: no policy evaluation needed.
-            body_bytes
+            (body_bytes, AuditDecision::Allow)
         };
 
         // ── 5. Forward to upstream ───────────────────────────────────────────
@@ -198,7 +226,19 @@ impl Proxy {
         *upstream_request.headers_mut() = parts.headers;
         upstream_request.headers_mut().remove(HOST);
 
-        match self.client.request(upstream_request).await {
+        let upstream_result = self.client.request(upstream_request).await;
+
+        // ── 6. Audit log ─────────────────────────────────────────────────────
+        let latency_us = request_start.elapsed().as_micros();
+        self.emit_audit(
+            &trace_id,
+            &agent_ctx,
+            &tool_name,
+            audit_decision,
+            latency_us,
+        );
+
+        match upstream_result {
             Ok(response) => relay_response(response).await,
             Err(error) => {
                 warn!(%error, "upstream MCP request failed");
@@ -211,6 +251,29 @@ impl Proxy {
                 )
             }
         }
+    }
+
+    /// Builds and enqueues one [`AuditLogEntry`][safegate_audit::AuditLogEntry]
+    /// for the completed request.
+    fn emit_audit(
+        &self,
+        trace_id: &str,
+        agent_ctx: &safegate_core::AgentContext,
+        tool_name: &str,
+        decision: AuditDecision,
+        latency_us: u128,
+    ) {
+        let entry = safegate_audit::AuditLogEntry::new(
+            chrono::Utc::now(),
+            trace_id.to_owned(),
+            Some(agent_ctx.tenant_id.clone()),
+            agent_ctx.agent_id.clone(),
+            tool_name.to_owned(),
+            decision,
+            latency_us,
+            self.audit_logger.hmac_secret(),
+        );
+        self.audit_logger.log(entry);
     }
 }
 
