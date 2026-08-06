@@ -1,10 +1,5 @@
 //! SafeGate's asynchronous MCP reverse proxy executable.
 
-mod config;
-mod identity;
-mod proxy;
-mod rate_limit;
-
 use std::sync::Arc;
 
 use hyper::service::service_fn;
@@ -12,8 +7,7 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
-use crate::config::ProxyConfig;
-use crate::proxy::Proxy;
+use safegate_proxy::{Proxy, ProxyConfig};
 
 /// Starts the SafeGate reverse proxy.
 #[tokio::main]
