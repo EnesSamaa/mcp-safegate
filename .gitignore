@@ -1,5 +1,8 @@
-target/
+﻿/target
 *.pdb
 *.rlib
 *.exe
-*.json
+*.dll
+*.so
+*.dylib
+walkthrough.md

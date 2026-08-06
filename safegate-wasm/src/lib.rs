@@ -9,6 +9,8 @@ use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
 
 /// Resource limits and execution deadlines for policy components.
 pub mod sandbox;
+/// Live file-watcher that hot-reloads `.wasm` policy modules without downtime.
+pub mod watcher;
 
 use crate::sandbox::WasmSandboxConfig;
 
@@ -180,6 +182,13 @@ impl WasmPolicyEngine {
     /// Returns the Wasmtime engine used by this policy runtime.
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    /// Returns the sandbox resource-limit configuration attached to this engine.
+    ///
+    /// Used by the hot-reload watcher to clone the limits into a replacement engine.
+    pub fn sandbox_config(&self) -> &WasmSandboxConfig {
+        &self.sandbox
     }
 }
 
