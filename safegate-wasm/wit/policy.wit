@@ -1,0 +1,32 @@
+package safegate:policy@0.1.0;
+
+/// Shared data types exchanged between the SafeGate host and policy components.
+interface types {
+  record agent-context {
+    agent-id: string,
+    tenant-id: string,
+    roles: list<string>,
+  }
+
+  record tool-request {
+    tool-name: string,
+    arguments-json: string,
+  }
+
+  variant policy-decision {
+    allow,
+    deny(string),
+    redact-args(string),
+  }
+}
+
+/// Contract implemented by a SafeGate policy component.
+world safegate-policy {
+  import types;
+  use types.{agent-context, tool-request, policy-decision};
+
+  export evaluate: func(
+    ctx: agent-context,
+    req: tool-request,
+  ) -> policy-decision;
+}

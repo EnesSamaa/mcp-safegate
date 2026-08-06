@@ -1,14 +1,193 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+//! WASI Component Model runtime support for SafeGate policy modules.
+
+use std::{path::Path, sync::Arc};
+
+use safegate_core::{AgentContext, McpToolCallParams, SafeGateError};
+use wasmtime::component::{Component, Linker};
+use wasmtime::{Config, Engine, Store};
+use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
+
+/// Bindings generated directly from the SafeGate WIT policy contract.
+///
+/// This macro expands at compile time, so an invalid `wit/policy.wit` schema
+/// prevents the crate from compiling.
+pub mod bindings {
+    wasmtime::component::bindgen!({
+        path: "wit",
+        world: "safegate-policy",
+        async: true,
+    });
+}
+
+/// WASI state made available to each policy component invocation.
+pub struct WasiState {
+    ctx: WasiCtx,
+    table: ResourceTable,
+}
+
+impl WasiState {
+    /// Creates a minimal, capability-free WASI host state.
+    pub fn new() -> Self {
+        Self {
+            ctx: WasiCtxBuilder::new().build(),
+            table: ResourceTable::new(),
+        }
+    }
+}
+
+impl Default for WasiState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WasiView for WasiState {
+    fn table(&mut self) -> &mut ResourceTable {
+        &mut self.table
+    }
+
+    fn ctx(&mut self) -> &mut WasiCtx {
+        &mut self.ctx
+    }
+}
+
+impl bindings::safegate::policy::types::Host for WasiState {}
+
+/// Result produced by a policy component after evaluating a tool call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyDecision {
+    /// The request may proceed to the upstream MCP server.
+    Allow,
+    /// The request must be rejected with the supplied reason.
+    Deny(String),
+    /// The supplied replacement JSON arguments must be used before forwarding.
+    RedactArgs(String),
+}
+
+/// Owns the Wasmtime runtime, WASI linker, and currently loaded policy component.
+pub struct WasmPolicyEngine {
+    engine: Engine,
+    linker: Linker<WasiState>,
+    component: Option<Arc<Component>>,
+}
+
+impl WasmPolicyEngine {
+    /// Creates an engine configured for WASI Component Model execution.
+    pub fn new() -> Result<Self, SafeGateError> {
+        let mut config = Config::new();
+        config.wasm_component_model(true);
+        config.async_support(true);
+        let engine = Engine::new(&config).map_err(wasm_execution_error)?;
+        let mut linker = Linker::new(&engine);
+
+        wasmtime_wasi::add_to_linker_async(&mut linker).map_err(wasm_execution_error)?;
+        bindings::SafegatePolicy::add_to_linker(&mut linker, |state| state)
+            .map_err(wasm_execution_error)?;
+
+        Ok(Self {
+            engine,
+            linker,
+            component: None,
+        })
+    }
+
+    /// Compiles and retains a policy component loaded from a `.wasm` file.
+    pub fn load_component_from_file(&mut self, path: &Path) -> Result<(), SafeGateError> {
+        let component = Component::from_file(&self.engine, path).map_err(wasm_execution_error)?;
+        self.component = Some(Arc::new(component));
+        Ok(())
+    }
+
+    /// Evaluates the currently loaded policy component for an MCP tool call.
+    pub async fn evaluate_policy(
+        &self,
+        ctx: &AgentContext,
+        req: &McpToolCallParams,
+    ) -> Result<PolicyDecision, SafeGateError> {
+        let component = self.component.as_ref().ok_or_else(|| {
+            SafeGateError::WasmExecutionError("no policy component has been loaded".to_owned())
+        })?;
+        let wit_context = bindings::AgentContext {
+            agent_id: ctx.agent_id.clone(),
+            tenant_id: ctx.tenant_id.clone(),
+            roles: ctx.roles.clone(),
+        };
+        let wit_request = bindings::ToolRequest {
+            tool_name: req.name.clone(),
+            arguments_json: req
+                .arguments
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "null".to_owned()),
+        };
+        let mut store = Store::new(&self.engine, WasiState::new());
+        let policy = bindings::SafegatePolicy::instantiate_async(
+            &mut store,
+            component.as_ref(),
+            &self.linker,
+        )
+        .await
+        .map_err(wasm_execution_error)?;
+        let decision = policy
+            .call_evaluate(&mut store, &wit_context, &wit_request)
+            .await
+            .map_err(wasm_execution_error)?;
+
+        Ok(match decision {
+            bindings::PolicyDecision::Allow => PolicyDecision::Allow,
+            bindings::PolicyDecision::Deny(reason) => PolicyDecision::Deny(reason),
+            bindings::PolicyDecision::RedactArgs(arguments) => {
+                PolicyDecision::RedactArgs(arguments)
+            }
+        })
+    }
+
+    /// Returns the Wasmtime engine used by this policy runtime.
+    pub fn engine(&self) -> &Engine {
+        &self.engine
+    }
+}
+
+/// Converts Wasmtime runtime and component loading errors into SafeGate errors.
+fn wasm_execution_error(error: impl std::fmt::Display) -> SafeGateError {
+    SafeGateError::WasmExecutionError(error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::{fs, path::Path};
+
+    use safegate_core::SafeGateError;
+
+    use super::WasmPolicyEngine;
 
     #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+    fn wit_bindings_compile_and_engine_initializes() {
+        // The generated `bindings` module is compiled before this test can run.
+        // Initializing the engine additionally validates the Component Model setup.
+        let engine = WasmPolicyEngine::new().expect("component model engine should initialize");
+        let _ = engine.engine();
+    }
+
+    #[test]
+    fn loading_a_missing_component_returns_a_controlled_wasm_error() {
+        let mut engine = WasmPolicyEngine::new().expect("engine should initialize");
+        let result = engine.load_component_from_file(Path::new("missing-policy-component.wasm"));
+
+        assert!(matches!(result, Err(SafeGateError::WasmExecutionError(_))));
+    }
+
+    #[test]
+    fn loading_a_corrupt_component_returns_a_controlled_wasm_error() {
+        let path = std::env::temp_dir().join(format!(
+            "safegate-corrupt-policy-{}.wasm",
+            std::process::id()
+        ));
+        fs::write(&path, b"not a wasm component").expect("corrupt fixture should be written");
+        let mut engine = WasmPolicyEngine::new().expect("engine should initialize");
+        let result = engine.load_component_from_file(&path);
+        fs::remove_file(&path).expect("corrupt fixture should be removed");
+
+        assert!(matches!(result, Err(SafeGateError::WasmExecutionError(_))));
     }
 }
