@@ -27,5 +27,5 @@ criterion = { version = "0.5", features = ["async_tokio"] }
 wiremock = "0.6"
 
 [[bench]]
-name = "proxy_benchmark"
+name = "proxy_bench"
 harness = false

@@ -106,6 +106,41 @@ sequenceDiagram
 ```
 
 
+## Enterprise Security & Reliability Layer (Week 3)
+
+SafeGate integrates an enterprise-grade security, observability, and resilience suite across all request flows:
+
+### 1. HMAC-SHA256 Audit Logging (`safegate-audit`)
+- **Tamper-Evident Records**: Structured log entries (timestamp, trace ID, agent context, tool name, decision, and latency) are signed with HMAC-SHA256.
+- **Asynchronous Non-Blocking Writer**: Background log queue (`tokio::sync::mpsc`) ensures proxy request forwarding is never delayed by I/O.
+- **Verification Utility**: Cryptographic verification functions detect log tampering or unauthorized entry modification.
+
+### 2. Prometheus Metrics & Health Probe
+- **Endpoints**:
+  - `GET /healthz` → Returns HTTP 200 `{"status": "healthy"}` for readiness/liveness probes.
+  - `GET /metrics` → Exposes Prometheus text-format metrics.
+- **Exposed Metrics**:
+  - `safegate_http_requests_total`: Counter categorized by HTTP status code and `tenant_id`.
+  - `safegate_policy_decisions_total`: Counter categorized by decision outcome (`allow`, `deny`, `redact`).
+  - `safegate_proxy_latency_seconds`: Full proxy pipeline latency distribution histogram.
+  - `safegate_wasm_execution_latency_seconds`: Isolated WASM policy execution latency histogram.
+
+### 3. Context Redaction & PII Eraser Engine (`PiiRedactor`)
+- **Automated Scanning**: Automatically inspects tool call arguments for sensitive information *before* WASM policy evaluation or upstream delivery.
+- **Detectors**:
+  - **API Keys / Secrets**: `sk-…` tokens and Bearer headers → `[REDACTED_SECRET]`
+  - **E-Mail Addresses**: RFC-5321 pattern matching → `[REDACTED_EMAIL]`
+  - **Payment Cards**: 13–19 digit patterns validated with the **Luhn Algorithm** → `[REDACTED_CARD]`
+  - **High-Entropy Secrets**: Dynamic Shannon Entropy scanning (≥4.5 bits/char) to catch raw API keys and randomly-generated secrets.
+
+### 4. Multi-Tenant WASM Policy Registry (`PolicyRegistry`)
+- **Dynamic Routing**: Maps incoming requests by `x-tenant-id` to dedicated WASM policy components (`policies/tenants/<tenant_id>.wasm`).
+- **Graceful Fallback**: Requests from unconfigured tenants automatically route to `policies/default.wasm`.
+- **Independent Hot-Reload**: Watches the tenant directory for file changes and updates tenant policy engines atomically without proxy restart.
+
+### 5. Circuit Breaker & Outlier Interceptor (`CircuitBreaker`)
+- **Quarantine Criteria**: If an agent accumulates 5 or more policy violations (`Deny`) within a rolling 10-second window, the circuit trips to **Open**.
+- **Cooldown Isolation**: Rejects all subsequent requests from the quarantined agent at the proxy layer with HTTP 429 (`CircuitOpen`) for 30 seconds, bypassing WASM evaluation entirely to protect upstream systems.
 
 ## Quickstart
 

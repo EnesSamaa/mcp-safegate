@@ -320,12 +320,16 @@ impl Proxy {
             }
         };
 
-        let mut upstream_request = Request::new(Full::new(body_to_forward));
+        let mut upstream_request = Request::new(Full::new(body_to_forward.clone()));
         *upstream_request.method_mut() = parts.method;
         *upstream_request.uri_mut() = uri;
         *upstream_request.version_mut() = parts.version;
         *upstream_request.headers_mut() = parts.headers;
         upstream_request.headers_mut().remove(HOST);
+        upstream_request.headers_mut().insert(
+            hyper::header::CONTENT_LENGTH,
+            hyper::header::HeaderValue::from(body_to_forward.len()),
+        );
 
         let upstream_result = self.client.request(upstream_request).await;
 
