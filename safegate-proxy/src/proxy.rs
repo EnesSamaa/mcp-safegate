@@ -2,7 +2,6 @@
 
 use std::{sync::Arc, time::Instant};
 
-use arc_swap::ArcSwap;
 use http_body_util::{BodyExt, Full};
 use hyper::{
     Request, Response, StatusCode, Uri,
@@ -17,11 +16,12 @@ use safegate_audit::{AuditDecision, writer::AuditLogger};
 use safegate_core::{
     JsonRpcErrorPayload, JsonRpcRequest, JsonRpcResponse, PiiRedactor, SafeGateError,
 };
-use safegate_wasm::WasmPolicyEngine;
+use safegate_wasm::PolicyRegistry;
 use serde_json::{Value, json};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::circuit_breaker::CircuitBreaker;
 use crate::config::ProxyConfig;
 use crate::identity::extract_agent_context;
 use crate::metrics::{
@@ -41,26 +41,30 @@ pub struct Proxy {
     target_base: Uri,
     client: HttpClient,
     rate_limiter: Arc<RateLimiter>,
-    /// Atomically-swappable handle to the currently active WASM policy engine.
+    /// Multi-tenant WASM policy registry.
     ///
-    /// Updated by [`PolicyWatcher`] whenever a new `.wasm` file is detected.
-    policy_engine: Arc<ArcSwap<WasmPolicyEngine>>,
+    /// Resolves the correct engine for each `tenant_id` on every request.
+    /// Falls back to the default engine when no tenant-specific policy is found.
+    policy_registry: Arc<PolicyRegistry>,
     /// Non-blocking structured audit logger.
     audit_logger: Arc<AuditLogger>,
     /// PII and secret-token redaction engine; applied before WASM policy evaluation.
     redactor: Arc<PiiRedactor>,
+    /// Per-agent circuit breaker to isolate high-frequency policy offenders.
+    circuit_breaker: Arc<CircuitBreaker>,
 }
 
 impl Proxy {
-    /// Creates a proxy using the supplied configuration, a live policy engine
-    /// handle, and an audit logger.
+    /// Creates a proxy using the supplied configuration, a live policy registry,
+    /// and an audit logger.
     ///
-    /// `policy_engine` is the [`ArcSwap`] produced by [`PolicyWatcher::shared()`].
+    /// `policy_registry` routes each request to the correct per-tenant WASM
+    /// engine, falling back to the default engine when needed.
     /// `audit_logger` is shared via [`Arc`] so the same instance can be used by
     /// multiple worker tasks.
     pub fn new(
         config: ProxyConfig,
-        policy_engine: Arc<ArcSwap<WasmPolicyEngine>>,
+        policy_registry: Arc<PolicyRegistry>,
         audit_logger: Arc<AuditLogger>,
     ) -> Result<Self, SafeGateError> {
         let target_base = config.target_mcp_url.parse::<Uri>().map_err(|error| {
@@ -77,9 +81,10 @@ impl Proxy {
             target_base,
             client: Client::builder(TokioExecutor::new()).build_http(),
             rate_limiter: Arc::new(RateLimiter::new()),
-            policy_engine,
+            policy_registry,
             audit_logger,
             redactor: Arc::new(PiiRedactor::new()),
+            circuit_breaker: Arc::new(CircuitBreaker::new()),
         })
     }
 
@@ -130,6 +135,12 @@ impl Proxy {
             AGENT_RATE_LIMIT,
             AGENT_RATE_LIMIT_WINDOW,
         ) {
+            return json_rpc_error_response(StatusCode::TOO_MANY_REQUESTS, Value::Null, error);
+        }
+
+        // ── 2.5 Circuit Breaker ──────────────────────────────────────────────
+        if let Err(error) = self.circuit_breaker.check(&agent_ctx.agent_id) {
+            warn!(agent_id = %agent_ctx.agent_id, "Circuit breaker tripped: rejecting request");
             return json_rpc_error_response(StatusCode::TOO_MANY_REQUESTS, Value::Null, error);
         }
 
@@ -208,8 +219,10 @@ impl Proxy {
             };
 
         // ── 4. WASM Policy evaluation ────────────────────────────────────────
-        // Load a snapshot of the current engine (lock-free ArcSwap).
-        let engine_guard = self.policy_engine.load();
+        // Resolve the tenant-specific (or default fallback) engine via the
+        // registry.  This is a lock-free ArcSwap load.
+        let engine_handle = self.policy_registry.get(&agent_ctx.tenant_id);
+        let engine_guard = engine_handle.load();
 
         // `body_to_forward` may be replaced by RedactArgs or PII redaction.
         // `audit_decision` is captured for the log entry.
@@ -250,6 +263,7 @@ impl Proxy {
                 }
                 Ok(safegate_wasm::PolicyDecision::Deny(reason)) => {
                     warn!(%reason, "WASM policy: Deny");
+                    self.circuit_breaker.record_failure(&agent_ctx.agent_id);
                     POLICY_DECISIONS_TOTAL.with_label_values(&["deny"]).inc();
                     let elapsed = request_start.elapsed();
                     PROXY_LATENCY_SECONDS.observe(elapsed.as_secs_f64());
@@ -375,13 +389,12 @@ impl Proxy {
     /// Handles `GET /healthz` – verifies that the proxy is running and the WASM
     /// policy engine has been successfully initialised, then returns HTTP 200.
     ///
-    /// The engine is considered healthy if the [`ArcSwap`] handle is loadable
-    /// (which it always is after `Proxy::new` succeeds).  A more sophisticated
-    /// liveness check could verify that a WASM component is actually loaded.
+    /// The engine is considered healthy if the registry's default engine handle
+    /// is loadable (which it always is after `Proxy::new` succeeds).
     fn handle_healthz(&self) -> Response<ProxyBody> {
-        // Load the engine snapshot; if the ArcSwap is poisoned this would panic,
-        // but ArcSwap::load is infallible in practice.
-        let _engine = self.policy_engine.load();
+        // Exercise the registry to ensure it is functional.
+        let _handle = self.policy_registry.get("__healthz__");
+        let _engine = _handle.load();
         let body = serde_json::to_vec(&json!({"status": "healthy"}))
             .expect("health response must serialize");
         Response::builder()
@@ -476,6 +489,11 @@ fn json_rpc_error_response(
             code: -32029,
             message: "Rate limit exceeded".to_owned(),
             data: None,
+        },
+        SafeGateError::CircuitOpen(message) => JsonRpcErrorPayload {
+            code: -32029,
+            message: "Circuit breaker open".to_owned(),
+            data: Some(json!({ "detail": message })),
         },
         SafeGateError::GuardrailViolation(message) => JsonRpcErrorPayload {
             code: -32002,

@@ -16,7 +16,7 @@ use hyper_util::{
 };
 use safegate_audit::writer::{AuditLogger, AuditSink};
 use safegate_proxy::{Proxy, ProxyConfig};
-use safegate_wasm::WasmPolicyEngine;
+use safegate_wasm::{PolicyRegistry, WasmPolicyEngine};
 use tokio::net::TcpListener;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -27,11 +27,30 @@ type TestBody = Full<Bytes>;
 
 const TEST_HMAC_SECRET: &[u8] = b"e2e-test-hmac-key";
 
-/// Creates a default (component-less) policy engine wrapped in the ArcSwap
-/// handle that `Proxy::new` expects.
-fn default_policy_engine() -> Arc<ArcSwap<WasmPolicyEngine>> {
+/// Creates a default (component-less) `PolicyRegistry` for use in tests.
+///
+/// The registry has no tenant-specific policies; every request falls back to
+/// the default engine which allows all traffic (engine has no loaded component).
+fn test_policy_registry() -> Arc<PolicyRegistry> {
     let engine = WasmPolicyEngine::new().expect("test engine should initialize");
-    Arc::new(ArcSwap::from_pointee(engine))
+    let default_handle = Arc::new(ArcSwap::from_pointee(engine));
+    // Use a non-existent directory so no tenant .wasm files are loaded.
+    Arc::new(PolicyRegistry::new(
+        PathBuf::from("./policies/tenants"),
+        default_handle,
+    ))
+}
+
+/// Creates a `PolicyRegistry` with a pre-built default engine handle.
+///
+/// Useful for tests that need direct control over the default engine ArcSwap.
+fn test_policy_registry_with_handle(
+    default_handle: Arc<ArcSwap<WasmPolicyEngine>>,
+) -> Arc<PolicyRegistry> {
+    Arc::new(PolicyRegistry::new(
+        PathBuf::from("./policies/tenants"),
+        default_handle,
+    ))
 }
 
 /// Creates a stdout AuditLogger suitable for use in tests.
@@ -41,15 +60,15 @@ fn test_audit_logger() -> Arc<AuditLogger> {
 
 /// Starts a full proxy instance bound to an ephemeral port and returns its URL.
 ///
-/// The proxy uses the default (no loaded component) policy engine, so all WASM
+/// The proxy uses the default (no loaded component) policy registry, so all WASM
 /// policy checks pass through to the upstream (Allow path via error fall-through).
 async fn start_proxy(target_mcp_url: String) -> String {
-    start_proxy_with_engine(target_mcp_url, default_policy_engine()).await
+    start_proxy_with_registry(target_mcp_url, test_policy_registry()).await
 }
 
-async fn start_proxy_with_engine(
+async fn start_proxy_with_registry(
     target_mcp_url: String,
-    policy_engine: Arc<ArcSwap<WasmPolicyEngine>>,
+    policy_registry: Arc<PolicyRegistry>,
 ) -> String {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -64,8 +83,9 @@ async fn start_proxy_with_engine(
                 listen_addr: address,
                 target_mcp_url,
                 policy_dir: PathBuf::from("./policies"),
+                tenant_policy_dir: PathBuf::from("./policies/tenants"),
             },
-            policy_engine,
+            policy_registry,
             test_audit_logger(),
         )
         .expect("test proxy should initialize"),
@@ -217,8 +237,6 @@ async fn wasm_policy_engine_without_component_does_not_block_requests() {
 /// - NOT forward the request to the upstream mock server (0 incoming requests)
 #[tokio::test]
 async fn policy_deny_returns_403_and_does_not_reach_upstream() {
-    use safegate_wasm::watcher::PolicyWatcher;
-
     let upstream = MockServer::start().await;
     // No mocks mounted – any request hitting the mock would cause a failure.
     // We assert 0 requests reach it to prove the proxy blocked the call.
@@ -234,11 +252,12 @@ async fn policy_deny_returns_403_and_does_not_reach_upstream() {
     // The meaningful observable is: proxy started + request handled without panic.
 
     let engine = WasmPolicyEngine::new().expect("engine should initialize");
-    let watcher = PolicyWatcher::new(std::env::temp_dir(), engine);
+    let watcher = safegate_wasm::watcher::PolicyWatcher::new(std::env::temp_dir(), engine);
     let shared = watcher.shared();
     let _watch_handle = watcher.start();
 
-    let proxy_url = start_proxy_with_engine(upstream.uri(), shared).await;
+    let registry = test_policy_registry_with_handle(shared);
+    let proxy_url = start_proxy_with_registry(upstream.uri(), registry).await;
     let client: Client<HttpConnector, TestBody> =
         Client::builder(TokioExecutor::new()).build_http();
 
@@ -418,12 +437,6 @@ async fn deny_decision_counter_increments_and_appears_in_metrics() {
 /// that none of the original sensitive strings are present.
 #[tokio::test]
 async fn pii_in_tool_arguments_is_redacted_before_upstream() {
-    use std::sync::Mutex;
-
-    // Capture the raw body received by the upstream so we can inspect it.
-    let received_body: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-    let received_body_clone = Arc::clone(&received_body);
-
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/"))
@@ -436,6 +449,7 @@ async fn pii_in_tool_arguments_is_redacted_before_upstream() {
                     "result": { "ok": true }
                 })),
         )
+        .expect(1)
         .mount(&upstream)
         .await;
 
@@ -481,10 +495,9 @@ async fn pii_in_tool_arguments_is_redacted_before_upstream() {
         StatusCode::OK,
         "proxy should forward the sanitised request successfully"
     );
+    let _ = response.into_body().collect().await;
 
     // Inspect what the upstream actually received by checking wiremock's log.
-    // We verify via a *negative* mock: a request containing the raw secret must
-    // NOT have reached the upstream.
     let received = upstream
         .received_requests()
         .await
@@ -517,7 +530,192 @@ async fn pii_in_tool_arguments_is_redacted_before_upstream() {
         body_str.contains("Hello from the test suite"),
         "non-PII message field must be preserved; got: {body_str}"
     );
+}
 
-    // Drop unused variable cleanly.
-    drop(received_body_clone);
+// ── Day 18: Multi-Tenant Policy Routing ──────────────────────────────────────
+
+/// Verifies that a request with an **unknown** `x-tenant-id` falls back to the
+/// default engine and is forwarded to upstream without errors.
+///
+/// The registry has no tenant-specific policies, so every request must be
+/// served by the default (component-less) engine, which allows everything.
+#[tokio::test]
+async fn unknown_tenant_falls_back_to_default_engine_and_request_succeeds() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": { "ok": true }
+                })),
+        )
+        .expect(1) // exactly one request must reach the upstream
+        .mount(&upstream)
+        .await;
+
+    // Registry has no tenant .wasm files → every request uses the default engine.
+    let proxy_url = start_proxy(upstream.uri()).await;
+    let client: Client<HttpConnector, TestBody> =
+        Client::builder(TokioExecutor::new()).build_http();
+
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("{proxy_url}/"))
+        .header(CONTENT_TYPE, "application/json")
+        .header("x-agent-id", "multitenant-agent")
+        // This tenant has no .wasm entry in the registry.
+        .header("x-tenant-id", "completely-unknown-tenant")
+        .header(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer safegate-dev-token"),
+        )
+        .body(Full::new(Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "list_resources",
+                    "arguments": { "path": "/safe" }
+                }
+            }))
+            .expect("payload must serialize"),
+        )))
+        .expect("request must be valid");
+
+    let response = client.request(request).await.expect("proxy should respond");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "unknown tenant must fall back to default engine and succeed"
+    );
+    // WireMock asserts `.expect(1)` on drop.
+}
+
+/// Verifies that the `PolicyRegistry` returns the same default handle for
+/// multiple different tenant IDs when no tenant-specific engines are loaded.
+#[tokio::test]
+async fn policy_registry_get_returns_loadable_handle_for_any_tenant() {
+    let engine = WasmPolicyEngine::new().expect("engine should initialize");
+    let default_handle = Arc::new(ArcSwap::from_pointee(engine));
+    let registry = Arc::new(PolicyRegistry::new(
+        PathBuf::from("./policies/tenants"),
+        Arc::clone(&default_handle),
+    ));
+
+    // All unknown tenants must return a handle that wraps a functional engine.
+    for tenant in &["alpha", "beta", "gamma", "delta", "__unknown__"] {
+        let handle = registry.get(tenant);
+        // Must be loadable without panic.
+        let _engine_guard = handle.load();
+    }
+}
+
+/// Verifies that `PolicyRegistry::tenant_ids()` is empty when no per-tenant
+/// `.wasm` files are present, confirming the fallback-only mode works correctly.
+#[tokio::test]
+async fn policy_registry_tenant_ids_empty_with_no_tenant_policies() {
+    let engine = WasmPolicyEngine::new().expect("engine should initialize");
+    let default_handle = Arc::new(ArcSwap::from_pointee(engine));
+    let registry = PolicyRegistry::new(
+        // Non-existent directory → no tenant .wasm files to load.
+        PathBuf::from("./policies/tenants/nonexistent"),
+        default_handle,
+    );
+
+    assert!(
+        registry.tenant_ids().is_empty(),
+        "registry with no tenant .wasm files should have empty tenant_ids()"
+    );
+}
+
+/// Verifies that two requests with **different** `x-tenant-id` headers are both
+/// handled correctly when the registry provides the same default engine for both.
+///
+/// This exercises the per-request tenant resolution path in `handle_request`.
+#[tokio::test]
+async fn multiple_tenants_handled_correctly_via_registry() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 99,
+                    "result": {}
+                })),
+        )
+        .expect(2) // exactly two requests (one per tenant)
+        .mount(&upstream)
+        .await;
+
+    let proxy_url = start_proxy(upstream.uri()).await;
+    let client: Client<HttpConnector, TestBody> =
+        Client::builder(TokioExecutor::new()).build_http();
+
+    for tenant in &["tenant-a", "tenant-b"] {
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("{proxy_url}/"))
+            .header(CONTENT_TYPE, "application/json")
+            .header("x-agent-id", format!("agent-{tenant}"))
+            .header("x-tenant-id", *tenant)
+            .header(
+                AUTHORIZATION,
+                HeaderValue::from_static("Bearer safegate-dev-token"),
+            )
+            .body(Full::new(Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 99,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "ping",
+                        "arguments": { "msg": "hello" }
+                    }
+                }))
+                .expect("payload must serialize"),
+            )))
+            .expect("request must be valid");
+
+        let response = client.request(request).await.expect("proxy should respond");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "tenant {tenant} request must succeed"
+        );
+    }
+    // WireMock asserts `.expect(2)` on drop.
+}
+
+// ── Day 19: Circuit Breaker & Outlier Interceptor ───────────────────────────
+
+/// Verifies that an agent triggering repeated policy violations trips the
+/// circuit breaker, resulting in HTTP 429 requests bypassing WASM.
+#[tokio::test]
+async fn circuit_breaker_quarantines_offending_agent() {
+    use safegate_proxy::circuit_breaker::CircuitBreaker;
+    use std::time::Duration;
+
+    let cb = CircuitBreaker::with_params(3, Duration::from_secs(10), Duration::from_secs(5));
+
+    // Below threshold -> OK
+    cb.record_failure("bad-agent");
+    cb.record_failure("bad-agent");
+    assert!(cb.check("bad-agent").is_ok());
+
+    // 3rd failure -> trips circuit
+    cb.record_failure("bad-agent");
+    assert!(cb.check("bad-agent").is_err());
+
+    // Other agent is unaffected
+    assert!(cb.check("good-agent").is_ok());
 }

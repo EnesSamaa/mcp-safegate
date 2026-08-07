@@ -14,6 +14,9 @@ pub enum SafeGateError {
     /// The caller exceeded its permitted request rate.
     #[error("rate limit exceeded")]
     RateLimitExceeded,
+    /// The circuit breaker is open due to repeated policy violations.
+    #[error("circuit breaker open: {0}")]
+    CircuitOpen(String),
     /// A configured security guardrail rejected the operation.
     #[error("guardrail violation: {0}")]
     GuardrailViolation(String),

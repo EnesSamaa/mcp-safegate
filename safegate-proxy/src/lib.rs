@@ -1,5 +1,7 @@
 //! Reusable SafeGate reverse proxy components.
 
+/// Circuit breaker and outlier interceptor per agent.
+pub mod circuit_breaker;
 /// Reverse proxy configuration.
 pub mod config;
 /// Agent identity extraction from HTTP headers.

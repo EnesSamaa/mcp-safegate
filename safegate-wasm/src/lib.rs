@@ -7,10 +7,14 @@ use wasmtime::component::{Component, Linker};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
 
+/// Multi-tenant WASM policy registry with hot-reload support.
+pub mod registry;
 /// Resource limits and execution deadlines for policy components.
 pub mod sandbox;
 /// Live file-watcher that hot-reloads `.wasm` policy modules without downtime.
 pub mod watcher;
+
+pub use registry::PolicyRegistry;
 
 use crate::sandbox::WasmSandboxConfig;
 

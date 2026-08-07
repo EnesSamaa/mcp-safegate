@@ -9,10 +9,15 @@ pub struct ProxyConfig {
     pub listen_addr: SocketAddr,
     /// Base URL of the upstream MCP server.
     pub target_mcp_url: String,
-    /// Directory that is watched for `.wasm` policy file changes.
+    /// Directory that is watched for the **default** `.wasm` policy file.
     ///
     /// Defaults to `./policies` relative to the working directory.
     pub policy_dir: PathBuf,
+    /// Directory that is watched for **per-tenant** `.wasm` policy files.
+    ///
+    /// Each file must be named `<tenant_id>.wasm`.
+    /// Defaults to `./policies/tenants` relative to the working directory.
+    pub tenant_policy_dir: PathBuf,
 }
 
 impl Default for ProxyConfig {
@@ -21,6 +26,7 @@ impl Default for ProxyConfig {
             listen_addr: SocketAddr::from(([127, 0, 0, 1], 8080)),
             target_mcp_url: "http://127.0.0.1:3000".to_owned(),
             policy_dir: PathBuf::from("./policies"),
+            tenant_policy_dir: PathBuf::from("./policies/tenants"),
         }
     }
 }
