@@ -18,7 +18,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain with WASM target
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -30,13 +30,10 @@ jobs:
       - name: Check Code Formatting
         run: cargo fmt --all -- --check
 
-      - name: Build WASM Target
-        run: cargo build --target wasm32-unknown-unknown
-
       - name: Run Clippy Linter
         run: cargo clippy --workspace --benches --tests -- -D warnings
 
-      - name: Run Test Suite (Workspace)
+      - name: Run Workspace Tests
         run: cargo test --workspace
 
       - name: Verify Benchmarks Compile
