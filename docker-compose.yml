@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  safegate-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: safegate:v0.1.0
+    container_name: safegate-proxy
+    ports:
+      - "8080:8080"
+    environment:
+      - SAFEGATE_LISTEN_ADDR=0.0.0.0:8080
+      - SAFEGATE_TARGET_MCP_URL=${SAFEGATE_TARGET_MCP_URL:-http://host.docker.internal:3000}
+      - SAFEGATE_POLICY_DIR=/app/policies
+      - SAFEGATE_TENANT_POLICY_DIR=/app/policies/tenants
+      - SAFEGATE_AUDIT_HMAC_SECRET=${SAFEGATE_AUDIT_HMAC_SECRET:-change-me-in-production}
+    volumes:
+      - ./policies:/app/policies:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  prometheus:
+    image: prom/prometheus:v2.45.0
+    container_name: safegate-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - safegate-proxy
+    restart: unless-stopped

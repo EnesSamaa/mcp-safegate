@@ -1,34 +1,59 @@
-name: CI
+name: SafeGate CI/CD Pipeline
 
 on:
   push:
-    branches: [main]
+    branches: [ main, master ]
   pull_request:
-    branches: [main]
+    branches: [ main, master ]
 
-permissions:
-  contents: read
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  test:
-    name: Format, lint, and test
+  check-and-test:
+    name: Code Quality & Test Suite
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check out repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install stable Rust
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
-      - name: Restore Cargo cache
-        uses: swatinem/rust-cache@v2
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
 
-      - name: Verify formatting
+      - name: Check Code Formatting
         run: cargo fmt --all -- --check
 
-      - name: Run Clippy
-        run: cargo clippy --workspace -- -D warnings
+      - name: Run Clippy Linter
+        run: cargo clippy --workspace --benches --tests -- -D warnings
 
-      - name: Run unit and integration tests
+      - name: Run Test Suite (Workspace)
         run: cargo test --workspace
+
+      - name: Verify Benchmarks Compile
+        run: cargo test --benches
+
+  docker-build:
+    name: Docker Image Build & Validation
+    runs-on: ubuntu-latest
+    needs: check-and-test
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: safegate:latest

@@ -1,0 +1,13 @@
+target/
+.git/
+.gitignore
+.agents/
+.gemini/
+.env
+*.log
+benches/
+tests/
+README.md
+walkthrough.md
+implementation_plan.md
+task.md

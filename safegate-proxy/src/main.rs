@@ -19,7 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .compact()
         .init();
 
-    let config = ProxyConfig::default();
+    let config = ProxyConfig::from_env();
 
     // ── Default WASM hot-reload watcher ──────────────────────────────────────
     // Watches `policy_dir` for the single default policy (default.wasm).
