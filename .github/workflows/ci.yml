@@ -37,7 +37,7 @@ jobs:
         run: cargo test --workspace
 
       - name: Verify Benchmarks Compile
-        run: cargo test --benches
+        run: cargo check --benches --workspace
 
   docker-build:
     name: Docker Image Build & Validation

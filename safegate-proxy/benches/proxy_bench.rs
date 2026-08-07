@@ -107,9 +107,7 @@ fn bench_proxy_pipeline(c: &mut Criterion) {
         .build()
         .expect("tokio runtime should build");
 
-    let mut group = c.benchmark_group("Proxy_Pipeline");
-
-    rt.block_on(async {
+    let (_upstream, proxy_url, client) = rt.block_on(async {
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/"))
@@ -175,35 +173,39 @@ fn bench_proxy_pipeline(c: &mut Criterion) {
         let client: Client<HttpConnector, TestBody> =
             Client::builder(TokioExecutor::new()).build_http();
 
-        group.bench_function("allow_request_pipeline", |b| {
-            b.to_async(&rt).iter(|| async {
-                let req = Request::builder()
-                    .method("POST")
-                    .uri(format!("{proxy_url}/"))
-                    .header(CONTENT_TYPE, "application/json")
-                    .header("x-agent-id", "bench-agent")
-                    .header("x-tenant-id", "bench-tenant")
-                    .header(
-                        AUTHORIZATION,
-                        HeaderValue::from_static("Bearer safegate-dev-token"),
-                    )
-                    .body(Full::new(Bytes::from(
-                        json!({
-                            "jsonrpc": "2.0",
-                            "id": 1,
-                            "method": "tools/call",
-                            "params": {
-                                "name": "ping",
-                                "arguments": { "msg": "hello" }
-                            }
-                        })
-                        .to_string(),
-                    )))
-                    .unwrap();
+        (upstream, proxy_url, client)
+    });
 
-                let res = client.request(req).await.unwrap();
-                assert_eq!(res.status(), StatusCode::OK);
-            });
+    let mut group = c.benchmark_group("Proxy_Pipeline");
+
+    group.bench_function("allow_request_pipeline", |b| {
+        b.to_async(&rt).iter(|| async {
+            let req = Request::builder()
+                .method("POST")
+                .uri(format!("{proxy_url}/"))
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-agent-id", "bench-agent")
+                .header("x-tenant-id", "bench-tenant")
+                .header(
+                    AUTHORIZATION,
+                    HeaderValue::from_static("Bearer safegate-dev-token"),
+                )
+                .body(Full::new(Bytes::from(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "ping",
+                            "arguments": { "msg": "hello" }
+                        }
+                    })
+                    .to_string(),
+                )))
+                .unwrap();
+
+            let res = client.request(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
         });
     });
 
