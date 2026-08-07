@@ -263,3 +263,148 @@ async fn policy_deny_returns_403_and_does_not_reach_upstream() {
     _watch_handle.abort();
     let _ = _watch_handle.await;
 }
+
+// ── Day 16: Prometheus Metrics & Health Probe ──────────────────────────────
+
+/// Verifies that `GET /healthz` returns HTTP 200 with `{"status":"healthy"}`.
+#[tokio::test]
+async fn healthz_returns_200_with_healthy_json() {
+    let upstream = MockServer::start().await;
+    let proxy_url = start_proxy(upstream.uri()).await;
+    let client: Client<HttpConnector, TestBody> =
+        Client::builder(TokioExecutor::new()).build_http();
+
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("{proxy_url}/healthz"))
+        .body(Full::new(Bytes::new()))
+        .expect("healthz request should be valid");
+
+    let response = client
+        .request(request)
+        .await
+        .expect("proxy should respond to /healthz");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "/healthz should return 200"
+    );
+
+    let body_bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("healthz body should be readable")
+        .to_bytes();
+    let body: serde_json::Value =
+        serde_json::from_slice(&body_bytes).expect("/healthz body should be valid JSON");
+    assert_eq!(
+        body["status"], "healthy",
+        "/healthz should report status=healthy"
+    );
+}
+
+/// Verifies that `GET /metrics` returns HTTP 200 and a valid Prometheus text
+/// exposition payload (must contain `# HELP` and `# TYPE` directives).
+#[tokio::test]
+async fn metrics_endpoint_returns_prometheus_text_format() {
+    let upstream = MockServer::start().await;
+    let proxy_url = start_proxy(upstream.uri()).await;
+    let client: Client<HttpConnector, TestBody> =
+        Client::builder(TokioExecutor::new()).build_http();
+
+    // Send one successful request first so the histograms have at least one
+    // observation and appear in the output.
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({"jsonrpc":"2.0","id":10,"result":{}})),
+        )
+        .mount(&upstream)
+        .await;
+    let _ = client
+        .request(tools_call_request(format!("{proxy_url}/"), true))
+        .await
+        .expect("warm-up request should succeed");
+
+    // Now fetch /metrics.
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("{proxy_url}/metrics"))
+        .body(Full::new(Bytes::new()))
+        .expect("metrics request should be valid");
+
+    let response = client
+        .request(request)
+        .await
+        .expect("proxy should respond to /metrics");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "/metrics should return 200"
+    );
+
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        content_type.starts_with("text/plain"),
+        "/metrics Content-Type should be text/plain, got {content_type}"
+    );
+
+    let body_bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("metrics body should be readable")
+        .to_bytes();
+    let body_str = std::str::from_utf8(&body_bytes).expect("/metrics body should be UTF-8");
+
+    assert!(
+        body_str.contains("# HELP") || body_str.contains("# TYPE"),
+        "/metrics output should contain Prometheus HELP or TYPE headers; got:\n{body_str}"
+    );
+    assert!(
+        body_str.contains("safegate_proxy_latency_seconds"),
+        "/metrics should contain proxy latency histogram"
+    );
+    assert!(
+        body_str.contains("safegate_http_requests_total"),
+        "/metrics should contain HTTP request counter"
+    );
+}
+
+/// Verifies that a deny policy decision increments `policy_decisions_total`
+/// with label `deny`.  Because we cannot load a real WASM component in tests,
+/// we directly increment the counter (unit-level test of the counter itself)
+/// and then confirm the increment shows up in the metrics output.
+#[tokio::test]
+async fn deny_decision_counter_increments_and_appears_in_metrics() {
+    use safegate_proxy::metrics::{POLICY_DECISIONS_TOTAL, gather_metrics_text};
+
+    let before = POLICY_DECISIONS_TOTAL.with_label_values(&["deny"]).get();
+
+    // Simulate two deny decisions being recorded.
+    POLICY_DECISIONS_TOTAL.with_label_values(&["deny"]).inc();
+    POLICY_DECISIONS_TOTAL.with_label_values(&["deny"]).inc();
+
+    let after = POLICY_DECISIONS_TOTAL.with_label_values(&["deny"]).get();
+    assert_eq!(
+        after - before,
+        2,
+        "deny counter should have incremented by 2"
+    );
+
+    // Verify the counter appears correctly in the Prometheus exposition format.
+    let metrics_text = gather_metrics_text().expect("metrics should serialise");
+    assert!(
+        metrics_text.contains("policy_decisions_total"),
+        "metrics output should include policy_decisions_total"
+    );
+}

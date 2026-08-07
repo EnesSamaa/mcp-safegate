@@ -4,6 +4,8 @@
 pub mod config;
 /// Agent identity extraction from HTTP headers.
 pub mod identity;
+/// Prometheus metrics: counters, histograms, and text serialisation.
+pub mod metrics;
 /// HTTP request validation and upstream forwarding.
 pub mod proxy;
 /// Concurrent per-agent request limiting.

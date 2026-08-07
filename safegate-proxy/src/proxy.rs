@@ -22,6 +22,10 @@ use uuid::Uuid;
 
 use crate::config::ProxyConfig;
 use crate::identity::extract_agent_context;
+use crate::metrics::{
+    HTTP_REQUESTS_TOTAL, POLICY_DECISIONS_TOTAL, PROXY_LATENCY_SECONDS,
+    WASM_EXECUTION_LATENCY_SECONDS, gather_metrics_text,
+};
 use crate::rate_limit::RateLimiter;
 
 type ProxyBody = Full<Bytes>;
@@ -77,15 +81,31 @@ impl Proxy {
     /// Validates an inbound request and relays it to the configured upstream MCP server.
     ///
     /// Request pipeline (in order):
+    /// 0. Special routes: `/metrics` and `/healthz`
     /// 1. Authentication check
     /// 2. Per-agent rate limiting
     /// 3. Body read + JSON-RPC parse
     /// 4. **WASM policy evaluation** (Allow / Deny / RedactArgs)
     /// 5. Upstream forwarding
     /// 6. **Immutable audit log entry** (emitted for every outcome)
+    /// 7. **Prometheus metrics** recording (latency + counters)
     pub async fn handle_request(&self, request: Request<Incoming>) -> Response<ProxyBody> {
         let request_start = Instant::now();
         let trace_id = Uuid::new_v4().to_string();
+
+        // ── 0. Special management routes ────────────────────────────────────
+        //
+        // These two routes bypass all proxy logic (auth, rate limiting, WASM,
+        // audit logging) and are handled directly here.
+        let path = request.uri().path().to_owned();
+
+        if path == "/metrics" {
+            return self.handle_metrics();
+        }
+
+        if path == "/healthz" {
+            return self.handle_healthz();
+        }
 
         // ── 1. Authentication ────────────────────────────────────────────────
         let (parts, body) = request.into_parts();
@@ -166,14 +186,25 @@ impl Proxy {
                 authenticated: agent_ctx.authenticated,
             };
 
-            match engine_guard.evaluate_policy(&wasm_ctx, tool_params).await {
+            let wasm_start = Instant::now();
+            let policy_result = engine_guard.evaluate_policy(&wasm_ctx, tool_params).await;
+            WASM_EXECUTION_LATENCY_SECONDS.observe(wasm_start.elapsed().as_secs_f64());
+
+            match policy_result {
                 Ok(safegate_wasm::PolicyDecision::Allow) => {
                     info!("WASM policy: Allow");
+                    POLICY_DECISIONS_TOTAL.with_label_values(&["allow"]).inc();
                     (body_bytes, AuditDecision::Allow)
                 }
                 Ok(safegate_wasm::PolicyDecision::Deny(reason)) => {
                     warn!(%reason, "WASM policy: Deny");
-                    let latency_us = request_start.elapsed().as_micros();
+                    POLICY_DECISIONS_TOTAL.with_label_values(&["deny"]).inc();
+                    let elapsed = request_start.elapsed();
+                    PROXY_LATENCY_SECONDS.observe(elapsed.as_secs_f64());
+                    HTTP_REQUESTS_TOTAL
+                        .with_label_values(&["403", &agent_ctx.tenant_id])
+                        .inc();
+                    let latency_us = elapsed.as_micros();
                     self.emit_audit(
                         &trace_id,
                         &agent_ctx,
@@ -189,6 +220,7 @@ impl Proxy {
                 }
                 Ok(safegate_wasm::PolicyDecision::RedactArgs(new_args_json)) => {
                     info!("WASM policy: RedactArgs – rewriting tool arguments");
+                    POLICY_DECISIONS_TOTAL.with_label_values(&["redact"]).inc();
                     // Rebuild the JSON-RPC body with the sanitised arguments.
                     let new_body = match rebuild_tool_call_body(&body_bytes, &new_args_json) {
                         Ok(new_body) => new_body,
@@ -203,6 +235,7 @@ impl Proxy {
                     // No loaded component → treat as Allow (engine not yet warmed up).
                     // Other engine errors are logged but do not block the request.
                     warn!(%error, "WASM policy evaluation failed; allowing request");
+                    POLICY_DECISIONS_TOTAL.with_label_values(&["allow"]).inc();
                     (body_bytes, AuditDecision::Allow)
                 }
             }
@@ -229,7 +262,8 @@ impl Proxy {
         let upstream_result = self.client.request(upstream_request).await;
 
         // ── 6. Audit log ─────────────────────────────────────────────────────
-        let latency_us = request_start.elapsed().as_micros();
+        let elapsed = request_start.elapsed();
+        let latency_us = elapsed.as_micros();
         self.emit_audit(
             &trace_id,
             &agent_ctx,
@@ -238,10 +272,22 @@ impl Proxy {
             latency_us,
         );
 
+        // ── 7. Prometheus metrics ─────────────────────────────────────────────
+        PROXY_LATENCY_SECONDS.observe(elapsed.as_secs_f64());
+
         match upstream_result {
-            Ok(response) => relay_response(response).await,
+            Ok(response) => {
+                let status_code = response.status().as_u16().to_string();
+                HTTP_REQUESTS_TOTAL
+                    .with_label_values(&[&status_code, &agent_ctx.tenant_id])
+                    .inc();
+                relay_response(response).await
+            }
             Err(error) => {
                 warn!(%error, "upstream MCP request failed");
+                HTTP_REQUESTS_TOTAL
+                    .with_label_values(&["502", &agent_ctx.tenant_id])
+                    .inc();
                 json_rpc_error_response(
                     StatusCode::BAD_GATEWAY,
                     request_id,
@@ -251,6 +297,44 @@ impl Proxy {
                 )
             }
         }
+    }
+
+    /// Handles `GET /metrics` – serialises all registered Prometheus metrics
+    /// in the standard text exposition format.
+    fn handle_metrics(&self) -> Response<ProxyBody> {
+        match gather_metrics_text() {
+            Ok(text) => Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")
+                .body(Full::new(Bytes::from(text)))
+                .expect("metrics response must be valid"),
+            Err(error) => {
+                warn!(%error, "failed to gather Prometheus metrics");
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Full::new(Bytes::from_static(b"metrics unavailable")))
+                    .expect("error response must be valid")
+            }
+        }
+    }
+
+    /// Handles `GET /healthz` – verifies that the proxy is running and the WASM
+    /// policy engine has been successfully initialised, then returns HTTP 200.
+    ///
+    /// The engine is considered healthy if the [`ArcSwap`] handle is loadable
+    /// (which it always is after `Proxy::new` succeeds).  A more sophisticated
+    /// liveness check could verify that a WASM component is actually loaded.
+    fn handle_healthz(&self) -> Response<ProxyBody> {
+        // Load the engine snapshot; if the ArcSwap is poisoned this would panic,
+        // but ArcSwap::load is infallible in practice.
+        let _engine = self.policy_engine.load();
+        let body = serde_json::to_vec(&json!({"status": "healthy"}))
+            .expect("health response must serialize");
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from(body)))
+            .expect("health response must be valid")
     }
 
     /// Builds and enqueues one [`AuditLogEntry`][safegate_audit::AuditLogEntry]
