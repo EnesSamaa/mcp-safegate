@@ -14,7 +14,9 @@ use hyper_util::{
     rt::TokioExecutor,
 };
 use safegate_audit::{AuditDecision, writer::AuditLogger};
-use safegate_core::{JsonRpcErrorPayload, JsonRpcRequest, JsonRpcResponse, SafeGateError};
+use safegate_core::{
+    JsonRpcErrorPayload, JsonRpcRequest, JsonRpcResponse, PiiRedactor, SafeGateError,
+};
 use safegate_wasm::WasmPolicyEngine;
 use serde_json::{Value, json};
 use tracing::{info, warn};
@@ -45,6 +47,8 @@ pub struct Proxy {
     policy_engine: Arc<ArcSwap<WasmPolicyEngine>>,
     /// Non-blocking structured audit logger.
     audit_logger: Arc<AuditLogger>,
+    /// PII and secret-token redaction engine; applied before WASM policy evaluation.
+    redactor: Arc<PiiRedactor>,
 }
 
 impl Proxy {
@@ -75,6 +79,7 @@ impl Proxy {
             rate_limiter: Arc::new(RateLimiter::new()),
             policy_engine,
             audit_logger,
+            redactor: Arc::new(PiiRedactor::new()),
         })
     }
 
@@ -172,12 +177,57 @@ impl Proxy {
             .map(|p| p.name.clone())
             .unwrap_or_else(|| "<non-tool>".to_owned());
 
+        // ── 3.5 PII Redaction ────────────────────────────────────────────────
+        //
+        // Scan and sanitise tool arguments for PII / secrets *before* they are
+        // forwarded to the WASM engine or upstream.  If any value is redacted
+        // the JSON-RPC body bytes are rebuilt so the cleaned payload propagates
+        // through the rest of the pipeline unchanged.
+        //
+        // We use a locally-owned copy of `tool_call_params` so that the
+        // sanitised arguments can be passed to `evaluate_policy` directly.
+        let (body_bytes, tool_call_params, pii_redacted) =
+            if let Some(mut params) = tool_call_params {
+                if let Some(ref mut args) = params.arguments {
+                    if self.redactor.sanitize_json(args) {
+                        // Rebuild the wire body with the sanitised arguments.
+                        let sanitised_args_json =
+                            serde_json::to_string(args).unwrap_or_else(|_| "null".to_owned());
+                        let new_body = rebuild_tool_call_body(&body_bytes, &sanitised_args_json)
+                            .unwrap_or(body_bytes);
+                        info!(tool = %params.name, "PII redactor sanitised tool arguments");
+                        (new_body, Some(params), true)
+                    } else {
+                        (body_bytes, Some(params), false)
+                    }
+                } else {
+                    (body_bytes, Some(params), false)
+                }
+            } else {
+                (body_bytes, None, false)
+            };
+
         // ── 4. WASM Policy evaluation ────────────────────────────────────────
         // Load a snapshot of the current engine (lock-free ArcSwap).
         let engine_guard = self.policy_engine.load();
 
-        // `body_to_forward` may be replaced by RedactArgs.
+        // `body_to_forward` may be replaced by RedactArgs or PII redaction.
         // `audit_decision` is captured for the log entry.
+        //
+        // If PII was already redacted in step 3.5, we start with a RedactArgs
+        // decision so the audit log always reflects the sanitisation.
+        let initial_decision = if pii_redacted {
+            POLICY_DECISIONS_TOTAL.with_label_values(&["redact"]).inc();
+            let sanitised_args = tool_call_params
+                .as_ref()
+                .and_then(|p| p.arguments.as_ref())
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "null".to_owned());
+            AuditDecision::RedactArgs(sanitised_args)
+        } else {
+            AuditDecision::Allow
+        };
+
         let (body_to_forward, audit_decision) = if let Some(ref tool_params) = tool_call_params {
             let wasm_ctx = safegate_core::AgentContext {
                 agent_id: agent_ctx.agent_id.clone(),
@@ -193,8 +243,10 @@ impl Proxy {
             match policy_result {
                 Ok(safegate_wasm::PolicyDecision::Allow) => {
                     info!("WASM policy: Allow");
-                    POLICY_DECISIONS_TOTAL.with_label_values(&["allow"]).inc();
-                    (body_bytes, AuditDecision::Allow)
+                    if !pii_redacted {
+                        POLICY_DECISIONS_TOTAL.with_label_values(&["allow"]).inc();
+                    }
+                    (body_bytes, initial_decision)
                 }
                 Ok(safegate_wasm::PolicyDecision::Deny(reason)) => {
                     warn!(%reason, "WASM policy: Deny");
@@ -221,7 +273,7 @@ impl Proxy {
                 Ok(safegate_wasm::PolicyDecision::RedactArgs(new_args_json)) => {
                     info!("WASM policy: RedactArgs – rewriting tool arguments");
                     POLICY_DECISIONS_TOTAL.with_label_values(&["redact"]).inc();
-                    // Rebuild the JSON-RPC body with the sanitised arguments.
+                    // Rebuild the JSON-RPC body with the WASM-sanitised arguments.
                     let new_body = match rebuild_tool_call_body(&body_bytes, &new_args_json) {
                         Ok(new_body) => new_body,
                         Err(error) => {
@@ -235,13 +287,15 @@ impl Proxy {
                     // No loaded component → treat as Allow (engine not yet warmed up).
                     // Other engine errors are logged but do not block the request.
                     warn!(%error, "WASM policy evaluation failed; allowing request");
-                    POLICY_DECISIONS_TOTAL.with_label_values(&["allow"]).inc();
-                    (body_bytes, AuditDecision::Allow)
+                    if !pii_redacted {
+                        POLICY_DECISIONS_TOTAL.with_label_values(&["allow"]).inc();
+                    }
+                    (body_bytes, initial_decision)
                 }
             }
         } else {
             // Non-tools/call method or non-POST: no policy evaluation needed.
-            (body_bytes, AuditDecision::Allow)
+            (body_bytes, initial_decision)
         };
 
         // ── 5. Forward to upstream ───────────────────────────────────────────

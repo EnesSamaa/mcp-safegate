@@ -10,9 +10,7 @@
 //! | `safegate_wasm_execution_latency_seconds` | Histogram | – | Only the WASM engine evaluation time |
 
 use once_cell::sync::Lazy;
-use prometheus::{
-    Encoder, HistogramOpts, IntCounterVec, Opts, Registry, TextEncoder,
-};
+use prometheus::{Encoder, HistogramOpts, IntCounterVec, Opts, Registry, TextEncoder};
 
 /// The shared Prometheus registry for all SafeGate metrics.
 ///

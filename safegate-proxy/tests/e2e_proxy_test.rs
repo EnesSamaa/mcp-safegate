@@ -408,3 +408,116 @@ async fn deny_decision_counter_increments_and_appears_in_metrics() {
         "metrics output should include policy_decisions_total"
     );
 }
+
+// ── Day 17: PII Eraser Engine ─────────────────────────────────────────────────
+
+/// Verifies that tool arguments containing PII (email + API key) are sanitised
+/// by the `PiiRedactor` *before* the request reaches the upstream mock server.
+///
+/// The test inspects the body actually received by the upstream and asserts
+/// that none of the original sensitive strings are present.
+#[tokio::test]
+async fn pii_in_tool_arguments_is_redacted_before_upstream() {
+    use std::sync::Mutex;
+
+    // Capture the raw body received by the upstream so we can inspect it.
+    let received_body: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let received_body_clone = Arc::clone(&received_body);
+
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 99,
+                    "result": { "ok": true }
+                })),
+        )
+        .mount(&upstream)
+        .await;
+
+    let proxy_url = start_proxy(upstream.uri()).await;
+    let client: Client<HttpConnector, TestBody> =
+        Client::builder(TokioExecutor::new()).build_http();
+
+    // Craft a tools/call request with PII embedded in the arguments.
+    let pii_payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 99,
+        "method": "tools/call",
+        "params": {
+            "name": "send_email",
+            "arguments": {
+                "recipient": "alice@secret-corp.com",
+                "api_key":   "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn",
+                "message":   "Hello from the test suite"
+            }
+        }
+    });
+
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("{proxy_url}/"))
+        .header(CONTENT_TYPE, "application/json")
+        .header("x-agent-id", "pii-test-agent")
+        .header("x-tenant-id", "pii-test-tenant")
+        .header(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer safegate-dev-token"),
+        )
+        .body(Full::new(Bytes::from(
+            serde_json::to_vec(&pii_payload).expect("payload must serialize"),
+        )))
+        .expect("PII test request must be valid");
+
+    let response = client.request(request).await.expect("proxy should respond");
+
+    // Proxy must succeed (the upstream accepted it).
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "proxy should forward the sanitised request successfully"
+    );
+
+    // Inspect what the upstream actually received by checking wiremock's log.
+    // We verify via a *negative* mock: a request containing the raw secret must
+    // NOT have reached the upstream.
+    let received = upstream
+        .received_requests()
+        .await
+        .expect("wiremock should have requests");
+    assert_eq!(
+        received.len(),
+        1,
+        "exactly one request should reach upstream"
+    );
+
+    let body_str = std::str::from_utf8(&received[0].body).expect("upstream body must be UTF-8");
+
+    assert!(
+        !body_str.contains("alice@secret-corp.com"),
+        "raw email must not reach upstream; got: {body_str}"
+    );
+    assert!(
+        !body_str.contains("sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+        "raw API key must not reach upstream; got: {body_str}"
+    );
+    assert!(
+        body_str.contains("[REDACTED_EMAIL]"),
+        "redacted email placeholder must be present; got: {body_str}"
+    );
+    assert!(
+        body_str.contains("[REDACTED_SECRET]"),
+        "redacted secret placeholder must be present; got: {body_str}"
+    );
+    assert!(
+        body_str.contains("Hello from the test suite"),
+        "non-PII message field must be preserved; got: {body_str}"
+    );
+
+    // Drop unused variable cleanly.
+    drop(received_body_clone);
+}
