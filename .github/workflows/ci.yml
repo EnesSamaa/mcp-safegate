@@ -18,16 +18,20 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+      - name: Install Rust toolchain with WASM target
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
       - name: Check Code Formatting
         run: cargo fmt --all -- --check
+
+      - name: Build WASM Target
+        run: cargo build --target wasm32-unknown-unknown
 
       - name: Run Clippy Linter
         run: cargo clippy --workspace --benches --tests -- -D warnings
