@@ -107,74 +107,77 @@ fn bench_proxy_pipeline(c: &mut Criterion) {
         .build()
         .expect("tokio runtime should build");
 
-    let (_upstream, proxy_url, client) = rt.block_on(async {
-        let upstream = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "application/json")
-                    .set_body_json(json!({
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "result": { "status": "ok" }
-                    })),
-            )
-            .mount(&upstream)
-            .await;
+    let (_upstream, proxy_url, client) =
+        rt.block_on(async {
+            let upstream = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/json")
+                        .set_body_json(json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "result": { "status": "ok" }
+                        })),
+                )
+                .mount(&upstream)
+                .await;
 
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener should bind");
-        let address = listener.local_addr().expect("listener address");
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("listener should bind");
+            let address = listener.local_addr().expect("listener address");
 
-        let engine = WasmPolicyEngine::new().expect("engine should initialize");
-        let default_handle = Arc::new(ArcSwap::from_pointee(engine));
-        let registry = Arc::new(PolicyRegistry::new(
-            PathBuf::from("./policies/tenants"),
-            default_handle,
-        ));
-        let audit_logger = Arc::new(AuditLogger::new(AuditSink::Stdout, b"bench-key"));
+            let engine = WasmPolicyEngine::new().expect("engine should initialize");
+            let default_handle = Arc::new(ArcSwap::from_pointee(engine));
+            let registry = Arc::new(PolicyRegistry::new(
+                PathBuf::from("./policies/tenants"),
+                default_handle,
+            ));
+            let audit_logger = Arc::new(AuditLogger::new(AuditSink::Stdout, b"bench-key"));
 
-        let proxy = Arc::new(
-            Proxy::new(
-                ProxyConfig {
-                    listen_addr: address,
-                    target_mcp_url: upstream.uri(),
-                    policy_dir: PathBuf::from("./policies"),
-                    tenant_policy_dir: PathBuf::from("./policies/tenants"),
-                },
-                registry,
-                audit_logger,
-            )
-            .expect("proxy should initialize"),
-        );
+            let proxy = Arc::new(
+                Proxy::new(
+                    ProxyConfig {
+                        listen_addr: address,
+                        target_mcp_url: upstream.uri(),
+                        policy_dir: PathBuf::from("./policies"),
+                        tenant_policy_dir: PathBuf::from("./policies/tenants"),
+                    },
+                    registry,
+                    audit_logger,
+                )
+                .expect("proxy should initialize"),
+            );
 
-        tokio::spawn(async move {
-            loop {
-                let (stream, _) = match listener.accept().await {
-                    Ok(s) => s,
-                    Err(_) => break,
-                };
-                let proxy = Arc::clone(&proxy);
-                tokio::spawn(async move {
-                    let service = hyper::service::service_fn(move |req| {
-                        let proxy = Arc::clone(&proxy);
-                        async move { Ok::<_, std::convert::Infallible>(proxy.handle_request(req).await) }
+            tokio::spawn(async move {
+                loop {
+                    let (stream, _) = match listener.accept().await {
+                        Ok(s) => s,
+                        Err(_) => break,
+                    };
+                    let proxy = Arc::clone(&proxy);
+                    tokio::spawn(async move {
+                        let service = hyper::service::service_fn(move |req| {
+                            let proxy = Arc::clone(&proxy);
+                            async move {
+                                Ok::<_, std::convert::Infallible>(proxy.handle_request(req).await)
+                            }
+                        });
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service)
+                            .await;
                     });
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(TokioIo::new(stream), service)
-                        .await;
-                });
-            }
+                }
+            });
+
+            let proxy_url = format!("http://{address}");
+            let client: Client<HttpConnector, TestBody> =
+                Client::builder(TokioExecutor::new()).build_http();
+
+            (upstream, proxy_url, client)
         });
-
-        let proxy_url = format!("http://{address}");
-        let client: Client<HttpConnector, TestBody> =
-            Client::builder(TokioExecutor::new()).build_http();
-
-        (upstream, proxy_url, client)
-    });
 
     let mut group = c.benchmark_group("Proxy_Pipeline");
 
