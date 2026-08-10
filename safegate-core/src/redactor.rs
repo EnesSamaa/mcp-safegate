@@ -205,7 +205,7 @@ pub(crate) fn luhn_check(digits: &str) -> bool {
         })
         .sum();
 
-    sum.is_multiple_of(10)
+    sum % 10 == 0
 }
 
 /// Replaces card-number-shaped digit sequences that also pass Luhn validation.
