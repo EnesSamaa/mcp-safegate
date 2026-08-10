@@ -6,4 +6,4 @@ members = [
     "safegate-audit",
 ]
 resolver = "2"
-rust-version = "1.88"
+rust-version = "1.88"

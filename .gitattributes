@@ -1,0 +1,17 @@
+# Normalize all text files to LF in the repository
+* text=auto eol=lf
+
+# Rust source files — always LF
+*.rs text eol=lf
+*.toml text eol=lf
+*.lock text eol=lf
+Dockerfile text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.sh text eol=lf
+
+# Binary files — no conversion
+*.png binary
+*.jpg binary
+*.wasm binary
