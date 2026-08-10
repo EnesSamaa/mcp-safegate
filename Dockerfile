@@ -1,5 +1,5 @@
 # ── Stage 1: Builder ─────────────────────────────────────────────────────────
-FROM rust:1.86-slim AS builder
+FROM rust:1.87-slim AS builder
 
 WORKDIR /usr/src/safegate
 
